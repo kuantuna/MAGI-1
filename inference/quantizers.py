@@ -20,15 +20,18 @@ class Granularity(str, Enum):
     PER_CHANNEL = "per_channel"
     # later: PER_HEAD, PER_GROUP, PER_TOKEN, ...
 
+class QuantLocation(Enum):
+    CACHE_ONLY = "cache_only"  # only on write/read from cache
+
 @dataclass
 class KVQuantizationConfig:
-    # what numeric "code" we use
     key_qdtype: QDType
-    value_qdtype: QDType
-
-    # how scales are applied
     key_granularity: Granularity
+    key_location: QuantLocation
+    
+    value_qdtype: QDType
     value_granularity: Granularity
+    value_location: QuantLocation
 
 
 class TensorQuantizer(Protocol):
@@ -166,6 +169,48 @@ def build_kv_quantizer(cfg: KVQuantizationConfig) -> KVQuantizer:
     )
     return KVQuantizer(k_quantizer=k_quantizer, v_quantizer=v_quantizer)
 
+def maybe_quantize_kv_for_point(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_quantizer: KVQuantizer,
+    cfg: KVQuantizationConfig,
+    point: QuantLocation,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # If this point doesn't match the configured location(s), just passthrough
+    if point != cfg.key_location and point != cfg.value_location:
+        return k, v
+
+    # Quantize accordingly
+    if point == cfg.key_location:
+        k, k_scale = kv_quantizer.quantize_k(k)
+        
+
+    if point == cfg.value_location:
+        v, v_scale = kv_quantizer.quantize_v(v)
+
+    return k, v
+
+def maybe_dequantize_kv_for_point(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    kv_quantizer: KVQuantizer,
+    cfg: KVQuantizationConfig,
+    point: QuantLocation,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # If this point doesn't match the configured location(s), just passthrough
+    if point != cfg.key_location and point != cfg.value_location:
+        return k, v
+
+    # Dequantize accordingly
+    if point == cfg.key_location:
+        k = kv_quantizer.dequantize_k(k, k_scale)
+        
+    if point == cfg.value_location:
+        v = kv_quantizer.dequantize_v(v, v_scale)
+
+    return k, v
 
 
 def quantization_metrics(x, x_hat):
