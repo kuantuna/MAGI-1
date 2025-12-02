@@ -73,12 +73,12 @@ class Float8E4M3PerTensorKVQuantizer(TensorQuantizer):
             scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)  # neutral; never actually used to reconstruct non-zero values
             q = x.new_zeros(x.shape, dtype=torch.float8_e4m3fn)
             return q, scale
-        # Use FP8 dynamic range with a scale factor:
-        # Let max_q be the largest finite value representable in this fp8 format.
-        # We choose s so that x / s fits roughly in [-max_q, max_q].
-        max_q = torch.finfo(torch.float8_e4m3fn).max
-        scale = max_abs / max_q   # s = max_abs / max_q
-        q = (x / scale).to(torch.float8_e4m3fn)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        fp8_min = torch.finfo(torch.float8_e4m3fn).min
+        scale = max_abs / fp8_max 
+        y = x / scale
+        y = torch.clamp(y, fp8_min, fp8_max)
+        q = y.to(torch.float8_e4m3fn)
         return q, scale
     
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -93,12 +93,12 @@ class Float8E5M2PerTensorKVQuantizer(TensorQuantizer):
             scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)  # neutral; never actually used to reconstruct non-zero values
             q = x.new_zeros(x.shape, dtype=torch.float8_e5m2)
             return q, scale
-        # Use FP8 dynamic range with a scale factor:
-        # Let max_q be the largest finite value representable in this fp8 format.
-        # We choose s so that x / s fits roughly in [-max_q, max_q].
-        max_q = torch.finfo(torch.float8_e5m2).max
-        scale = max_abs / max_q   # s = max_abs / max_q
-        q = (x / scale).to(torch.float8_e5m2)
+        fp8_max = torch.finfo(torch.float8_e5m2).max
+        fp8_min = torch.finfo(torch.float8_e5m2).min
+        scale = max_abs / fp8_max 
+        y = x / scale
+        y = torch.clamp(y, fp8_min, fp8_max)
+        q = y.to(torch.float8_e5m2)
         return q, scale
     
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
