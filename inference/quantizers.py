@@ -1,6 +1,6 @@
 import torch
 import logging
-from typing import Protocol
+from typing import Protocol, Union
 from dataclasses import dataclass
 from enum import Enum
 
@@ -12,16 +12,17 @@ class QDType(str, Enum):
     INT8 = "int8"
     FP8_E4M3 = "fp8_e4m3"
     FP8_E5M2 = "fp8_e5m2"
-    # later: FP4, INT4, etc.
 
 
 class Granularity(str, Enum):
     PER_TENSOR = "per_tensor"
     PER_CHANNEL = "per_channel"
-    # later: PER_HEAD, PER_GROUP, PER_TOKEN, ...
+    PER_HEAD = "per_head"
+    PER_TOKEN = "per_token"
 
 class QuantLocation(Enum):
-    CACHE_ONLY = "cache_only"  # only on write/read from cache
+    POST_ROPE = "post_rope" # just before caching K/V
+    PRE_ROPE = "pre_rope" # before applying RoPE
 
 @dataclass
 class KVQuantizationConfig:
@@ -35,44 +36,46 @@ class KVQuantizationConfig:
 
 
 class TensorQuantizer(Protocol):
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize(self, x: torch.Tensor, dim: Union[int, tuple[int, ...], None]) -> tuple[torch.Tensor, torch.Tensor]:
         ...
 
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         ...
 
 
-TENSOR_QUANTIZER_REGISTRY: dict[tuple[QDType, Granularity], type[TensorQuantizer]] = {}
+TENSOR_QUANTIZER_REGISTRY: dict[QDType, type[TensorQuantizer]] = {}
 
-def register_tensor_quantizer(qdtype: QDType, granularity: Granularity):
+def register_tensor_quantizer(qdtype: QDType):
     def deco(cls: type[TensorQuantizer]):
-        TENSOR_QUANTIZER_REGISTRY[(qdtype, granularity)] = cls
+        TENSOR_QUANTIZER_REGISTRY[qdtype] = cls
         return cls
     return deco
 
 
-@register_tensor_quantizer(QDType.NONE, Granularity.PER_TENSOR)
+@register_tensor_quantizer(QDType.NONE)
 class NoOpKVQuantizer(TensorQuantizer):
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize(self, x: torch.Tensor, dim: Union[int, tuple[int, ...], None]) -> tuple[torch.Tensor, torch.Tensor]:
         return x, torch.tensor(1.0, device=x.device, dtype=torch.float32)
 
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return q
 
 
-@register_tensor_quantizer(QDType.INT8, Granularity.PER_TENSOR)
-class Int8PerTensorKVQuantizer(TensorQuantizer):
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+@register_tensor_quantizer(QDType.INT8)
+class Int8KVQuantizer(TensorQuantizer):
+    def quantize(self, x: torch.Tensor, dim: Union[int, tuple[int, ...], None]) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
-        max_abs = x.abs().max()
-        if max_abs == 0.0:
-            logger.warning("Input tensor is all zeros; returning zero quantized tensor.")
-            scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)  # neutral; never actually used to reconstruct non-zero values
-            q = x.new_zeros(x.shape, dtype=torch.int8)
-            return q, scale
+        
+        if dim is None:
+            max_abs = x.abs().max()
+        else:
+            max_abs = torch.amax(x.abs(), dim=dim, keepdim=True)
+
         # Symmetric int8 quantization: q in [-128, 127]
         # s = max_abs / 127  →  x / s ∈ [-127, 127]
         scale = max_abs / 127.0  # step size s
+        scale = torch.clamp(scale, min=1e-5) 
+
         q = (x / scale).round().clamp(-128, 127).to(torch.int8)
         return q, scale
     
@@ -80,19 +83,22 @@ class Int8PerTensorKVQuantizer(TensorQuantizer):
         return (q.float() * scale).to(torch.bfloat16)
 
 
-@register_tensor_quantizer(QDType.FP8_E4M3, Granularity.PER_TENSOR)
-class Float8E4M3PerTensorKVQuantizer(TensorQuantizer):
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+@register_tensor_quantizer(QDType.FP8_E4M3)
+class Float8E4M3KVQuantizer(TensorQuantizer):
+    def quantize(self, x: torch.Tensor, dim: Union[int, tuple[int, ...], None]) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
-        max_abs = x.abs().max()
-        if max_abs == 0.0:
-            logger.warning("Input tensor is all zeros; returning zero quantized tensor.")
-            scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)  # neutral; never actually used to reconstruct non-zero values
-            q = x.new_zeros(x.shape, dtype=torch.float8_e4m3fn)
-            return q, scale
+        
+        if dim is None:
+            max_abs = x.abs().max()
+        else:
+            max_abs = torch.amax(x.abs(), dim=dim, keepdim=True)
+
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         fp8_min = torch.finfo(torch.float8_e4m3fn).min
-        scale = max_abs / fp8_max 
+        
+        scale = max_abs / fp8_max
+        scale = torch.clamp(scale, min=1e-9)
+
         y = x / scale
         y = torch.clamp(y, fp8_min, fp8_max)
         q = y.to(torch.float8_e4m3fn)
@@ -102,19 +108,22 @@ class Float8E4M3PerTensorKVQuantizer(TensorQuantizer):
         return (q.float() * scale).to(torch.bfloat16)
 
 
-@register_tensor_quantizer(QDType.FP8_E5M2, Granularity.PER_TENSOR)
-class Float8E5M2PerTensorKVQuantizer(TensorQuantizer):
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+@register_tensor_quantizer(QDType.FP8_E5M2)
+class Float8E5M2KVQuantizer(TensorQuantizer):
+    def quantize(self, x: torch.Tensor, dim: Union[int, tuple[int, ...], None]) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
-        max_abs = x.abs().max()
-        if max_abs == 0.0:
-            logger.warning("Input tensor is all zeros; returning zero quantized tensor.")
-            scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)  # neutral; never actually used to reconstruct non-zero values
-            q = x.new_zeros(x.shape, dtype=torch.float8_e5m2)
-            return q, scale
+        
+        if dim is None:
+            max_abs = x.abs().max()
+        else:
+            max_abs = torch.amax(x.abs(), dim=dim, keepdim=True)
+
         fp8_max = torch.finfo(torch.float8_e5m2).max
         fp8_min = torch.finfo(torch.float8_e5m2).min
+
         scale = max_abs / fp8_max 
+        scale = torch.clamp(scale, min=1e-9)
+
         y = x / scale
         y = torch.clamp(y, fp8_min, fp8_max)
         q = y.to(torch.float8_e5m2)
@@ -148,8 +157,8 @@ class KVQuantizer:
         value_granularity: Granularity,
         value_location: QuantLocation,
     ) -> "KVQuantizer":
-        k_quantizer = build_tensor_quantizer(key_qdtype, key_granularity)
-        v_quantizer = build_tensor_quantizer(value_qdtype, value_granularity)
+        k_quantizer = build_tensor_quantizer(key_qdtype)
+        v_quantizer = build_tensor_quantizer(value_qdtype)
         return cls(
             key_qdtype=key_qdtype,
             key_granularity=key_granularity,
@@ -161,25 +170,55 @@ class KVQuantizer:
             v_quantizer=v_quantizer,
         )
     
+    def _resolve_reduce_dims(self, location: QuantLocation, granularity: Granularity) -> Union[int, tuple[int, ...], None]:
+        """
+        Returns the dimensions to REDUCE (squash) to achieve the desired granularity.
+        """
+        if granularity == Granularity.PER_TENSOR:
+            return None
+        
+        if location == QuantLocation.POST_ROPE:
+            # Shape: [bs*seq, kv_heads, head_dim]
+            if granularity == Granularity.PER_TOKEN:
+                return 0
+            if granularity == Granularity.PER_CHANNEL:
+                return (1, 2)
+            if granularity == Granularity.PER_HEAD:
+                return 1
+
+        elif location == QuantLocation.PRE_ROPE:
+            # Shape: [bs, seq, kv_heads, head_dim]
+            if granularity == Granularity.PER_TOKEN:
+                return 1
+            if granularity == Granularity.PER_CHANNEL:
+                return (2, 3)
+            if granularity == Granularity.PER_HEAD:
+                return 2
+            
+        else:
+            raise ValueError(f"Unsupported QuantLocation: {location} for granularity resolution: {granularity}")
+    
     def quantize_k(self, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.k_quantizer.quantize(key)
+        dim = self._resolve_reduce_dims(self.key_location, self.key_granularity)
+        return self.k_quantizer.quantize(key, dim=dim)
     
     def dequantize_k(self, key: torch.Tensor, scale_k: torch.Tensor) -> torch.Tensor:
         return self.k_quantizer.dequantize(key, scale_k)
 
     def quantize_v(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.v_quantizer.quantize(value) 
+        dim = self._resolve_reduce_dims(self.value_location, self.value_granularity)
+        return self.v_quantizer.quantize(value, dim=dim) 
 
     def dequantize_v(self, value: torch.Tensor, scale_v: torch.Tensor) -> torch.Tensor:
         return self.v_quantizer.dequantize(value, scale_v)
 
 
 
-def build_tensor_quantizer(qdtype: QDType, granularity: Granularity) -> TensorQuantizer:
+def build_tensor_quantizer(qdtype: QDType) -> TensorQuantizer:
     try:
-        cls = TENSOR_QUANTIZER_REGISTRY[(qdtype, granularity)]
+        cls = TENSOR_QUANTIZER_REGISTRY[qdtype]
     except KeyError:
-        raise ValueError(f"No TensorQuantizer registered for {qdtype} / {granularity}")
+        raise ValueError(f"No TensorQuantizer registered for {qdtype}")
     return cls()
 
 

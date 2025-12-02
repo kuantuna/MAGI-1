@@ -37,10 +37,10 @@ def main():
     kv_quantizer = KVQuantizer.from_cfg(
         key_qdtype=QDType.INT8,
         key_granularity=Granularity.PER_TENSOR,
-        key_location=QuantLocation.CACHE_ONLY,
+        key_location=QuantLocation.POST_ROPE,
         value_qdtype=QDType.INT8,
         value_granularity=Granularity.PER_TENSOR,
-        value_location=QuantLocation.CACHE_ONLY,
+        value_location=QuantLocation.POST_ROPE,
     )
     experiment_ctx = ExperimentContext(
         name="default_experiment",
