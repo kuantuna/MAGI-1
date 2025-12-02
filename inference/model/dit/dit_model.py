@@ -35,6 +35,7 @@ from inference.common import (
 from inference.infra.checkpoint import load_checkpoint
 from inference.infra.distributed import parallel_state as mpu
 from inference.infra.parallelism import cp_post_process, cp_pre_process, pp_scheduler
+from inference.quantizers import ExperimentContext
 
 from .dit_module import CaptionEmbedder, FinalLinear, LearnableRotaryEmbeddingCat, TimestepEmbedder, TransformerBlock
 
@@ -48,13 +49,13 @@ class VideoDiTModel(torch.nn.Module):
         post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
     """
 
-    def __init__(self, config: MagiConfig, pre_process: bool = True, post_process: bool = True) -> None:
+    def __init__(self, config: MagiConfig, experiment_ctx: ExperimentContext, pre_process: bool = True, post_process: bool = True) -> None:
         super().__init__()
 
         self.model_config = config.model_config
         self.runtime_config = config.runtime_config
         self.engine_config = config.engine_config
-
+        self.experiment_ctx = experiment_ctx
         self.pre_process = pre_process
         self.post_process = post_process
         self.in_channels = self.model_config.in_channels
@@ -597,12 +598,12 @@ class VideoDiTModel(torch.nn.Module):
             raise NotImplementedError
 
 
-def _build_dit_model(config: MagiConfig):
+def _build_dit_model(config: MagiConfig, experiment_ctx: ExperimentContext):
     """Builds the model"""
     device = "cuda" if env_is_true("SKIP_LOAD_MODEL") else "meta"
     with torch.device(device):
         model = VideoDiTModel(
-            config=config, pre_process=mpu.is_pipeline_first_stage(), post_process=mpu.is_pipeline_last_stage()
+            config=config,  experiment_ctx=experiment_ctx, pre_process=mpu.is_pipeline_first_stage(), post_process=mpu.is_pipeline_last_stage(),
         )
     print_rank_0(model)
 
@@ -638,9 +639,9 @@ def _high_precision_promoter(module: VideoDiTModel):
     return module
 
 
-def get_dit(config: MagiConfig):
+def get_dit(config: MagiConfig, experiment_ctx: ExperimentContext):
     """Build and load VideoDiT model"""
-    model = _build_dit_model(config)
+    model = _build_dit_model(config, experiment_ctx)
     print_rank_0("Build DiTModel successfully")
 
     mem_allocated_gb = torch.cuda.memory_allocated() / 1024**3

@@ -6,7 +6,7 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-
+# ---- enums ----
 class QDType(str, Enum):
     NONE = "none"
     INT8 = "int8"
@@ -42,13 +42,25 @@ class TensorQuantizer(Protocol):
         ...
 
 
+TENSOR_QUANTIZER_REGISTRY: dict[tuple[QDType, Granularity], type[TensorQuantizer]] = {}
+
+def register_tensor_quantizer(qdtype: QDType, granularity: Granularity):
+    def deco(cls: type[TensorQuantizer]):
+        TENSOR_QUANTIZER_REGISTRY[(qdtype, granularity)] = cls
+        return cls
+    return deco
+
+
+@register_tensor_quantizer(QDType.NONE, Granularity.PER_TENSOR)
 class NoOpKVQuantizer(TensorQuantizer):
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return x, torch.tensor(1.0, device=x.device, dtype=torch.float32)
 
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return q
-    
+
+
+@register_tensor_quantizer(QDType.INT8, Granularity.PER_TENSOR)
 class Int8PerTensorKVQuantizer(TensorQuantizer):
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
@@ -67,6 +79,8 @@ class Int8PerTensorKVQuantizer(TensorQuantizer):
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return (q.float() * scale).to(torch.bfloat16)
 
+
+@register_tensor_quantizer(QDType.FP8_E4M3, Granularity.PER_TENSOR)
 class Float8E4M3PerTensorKVQuantizer(TensorQuantizer):
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
@@ -86,7 +100,9 @@ class Float8E4M3PerTensorKVQuantizer(TensorQuantizer):
     
     def dequantize(self, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return (q.float() * scale).to(torch.bfloat16)
-    
+
+
+@register_tensor_quantizer(QDType.FP8_E5M2, Granularity.PER_TENSOR)
 class Float8E5M2PerTensorKVQuantizer(TensorQuantizer):
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.float()
@@ -108,109 +124,70 @@ class Float8E5M2PerTensorKVQuantizer(TensorQuantizer):
         return (q.float() * scale).to(torch.bfloat16)
 
 
-# Registry mapping (QDType, Granularity) to TensorQuantizer classes
-TENSOR_QUANTIZER_REGISTRY: dict[tuple[QDType, Granularity], type[TensorQuantizer]] = {
-    (QDType.NONE, Granularity.PER_TENSOR): NoOpKVQuantizer,
-    (QDType.INT8, Granularity.PER_TENSOR): Int8PerTensorKVQuantizer,
-    (QDType.FP8_E4M3, Granularity.PER_TENSOR): Float8E4M3PerTensorKVQuantizer,
-    (QDType.FP8_E5M2, Granularity.PER_TENSOR): Float8E5M2PerTensorKVQuantizer,
-    # later:
-    # (QDType.INT8, Granularity.PER_CHANNEL): Int8PerChannelKVQuantizer,
-    # (QDType.INT4, Granularity.PER_TENSOR): Int4PerTensorKVQuantizer,
-}
-
-
-
+@dataclass
 class KVQuantizer:
-    def __init__(self, k_quantizer: TensorQuantizer, v_quantizer: TensorQuantizer):
-        self.k_quantizer = k_quantizer
-        self.v_quantizer = v_quantizer
+    # metadata / config aspect
+    key_qdtype: QDType
+    key_granularity: Granularity
+    key_location: QuantLocation
+    value_qdtype: QDType
+    value_granularity: Granularity
+    value_location: QuantLocation
 
+    # behavior aspect
+    k_quantizer: TensorQuantizer
+    v_quantizer: TensorQuantizer
+
+    @classmethod
+    def from_cfg(
+        cls,
+        key_qdtype: QDType,
+        key_granularity: Granularity,
+        key_location: QuantLocation,
+        value_qdtype: QDType,
+        value_granularity: Granularity,
+        value_location: QuantLocation,
+    ) -> "KVQuantizer":
+        k_quantizer = build_tensor_quantizer(key_qdtype, key_granularity)
+        v_quantizer = build_tensor_quantizer(value_qdtype, value_granularity)
+        return cls(
+            key_qdtype=key_qdtype,
+            key_granularity=key_granularity,
+            key_location=key_location,
+            value_qdtype=value_qdtype,
+            value_granularity=value_granularity,
+            value_location=value_location,
+            k_quantizer=k_quantizer,
+            v_quantizer=v_quantizer,
+        )
+    
     def quantize_k(self, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.k_quantizer.quantize(key)
-
+    
     def dequantize_k(self, key: torch.Tensor, scale_k: torch.Tensor) -> torch.Tensor:
         return self.k_quantizer.dequantize(key, scale_k)
 
     def quantize_v(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.v_quantizer.quantize(value)
+        return self.v_quantizer.quantize(value) 
 
     def dequantize_v(self, value: torch.Tensor, scale_v: torch.Tensor) -> torch.Tensor:
         return self.v_quantizer.dequantize(value, scale_v)
 
 
-def build_tensor_quantizer(
-    qdtype: QDType,
-    granularity: Granularity,
-) -> TensorQuantizer:
-    # special-case NONE if you want to ignore granularity:
-    if qdtype == QDType.NONE:
-        return NoOpKVQuantizer()
 
-    key = (qdtype, granularity)
+def build_tensor_quantizer(qdtype: QDType, granularity: Granularity) -> TensorQuantizer:
     try:
-        quant_cls = TENSOR_QUANTIZER_REGISTRY[key]
+        cls = TENSOR_QUANTIZER_REGISTRY[(qdtype, granularity)]
     except KeyError:
-        if qdtype not in {k[0] for k in TENSOR_QUANTIZER_REGISTRY}:
-            raise ValueError(f"Unknown qdtype {qdtype}")
-        raise ValueError(f"Unsupported granularity {granularity} for {qdtype}")
-
-    return quant_cls()
+        raise ValueError(f"No TensorQuantizer registered for {qdtype} / {granularity}")
+    return cls()
 
 
-def build_kv_quantizer(cfg: KVQuantizationConfig) -> KVQuantizer:
-    k_quantizer = build_tensor_quantizer(
-        cfg.key_qdtype,
-        cfg.key_granularity,
-    )
-    v_quantizer = build_tensor_quantizer(
-        cfg.value_qdtype,
-        cfg.value_granularity,
-    )
-    return KVQuantizer(k_quantizer=k_quantizer, v_quantizer=v_quantizer)
 
-def maybe_quantize_kv_for_point(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    kv_quantizer: KVQuantizer,
-    cfg: KVQuantizationConfig,
-    point: QuantLocation,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # If this point doesn't match the configured location(s), just passthrough
-    if point != cfg.key_location and point != cfg.value_location:
-        return k, v
-
-    # Quantize accordingly
-    if point == cfg.key_location:
-        k, k_scale = kv_quantizer.quantize_k(k)
-        
-
-    if point == cfg.value_location:
-        v, v_scale = kv_quantizer.quantize_v(v)
-
-    return k, v
-
-def maybe_dequantize_kv_for_point(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    kv_quantizer: KVQuantizer,
-    cfg: KVQuantizationConfig,
-    point: QuantLocation,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # If this point doesn't match the configured location(s), just passthrough
-    if point != cfg.key_location and point != cfg.value_location:
-        return k, v
-
-    # Dequantize accordingly
-    if point == cfg.key_location:
-        k = kv_quantizer.dequantize_k(k, k_scale)
-        
-    if point == cfg.value_location:
-        v = kv_quantizer.dequantize_v(v, v_scale)
-
-    return k, v
+@dataclass
+class ExperimentContext:
+    name: str
+    kv_quantizer: KVQuantizer
 
 
 def quantization_metrics(x, x_hat):

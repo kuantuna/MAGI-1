@@ -18,6 +18,7 @@ import torch
 from inference.common import MagiConfig, print_rank_0, set_random_seed
 from inference.infra.distributed import dist_init
 from inference.model.dit import get_dit
+from inference.quantizers import ExperimentContext
 
 from .prompt_process import get_txt_embeddings
 from .video_generate import generate_per_chunk
@@ -25,10 +26,12 @@ from .video_process import post_chunk_process, process_image, process_prefix_vid
 
 
 class MagiPipeline:
-    def __init__(self, config_path):
+    def __init__(self, config_path, experiment_ctx: ExperimentContext):
         self.config = MagiConfig.from_json(config_path)
+        self.experiment_ctx = experiment_ctx
         set_random_seed(self.config.runtime_config.seed)
         dist_init(self.config)
+        print_rank_0(f"[Experiment] {self.experiment_ctx.name}")
         print_rank_0(self.config)
 
     def run_text_to_video(self, prompt: str, output_path: str):
