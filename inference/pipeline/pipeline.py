@@ -47,7 +47,7 @@ class MagiPipeline:
 
     def _run(self, prompt: str, prefix_video: torch.Tensor, output_path: str):
         caption_embs, emb_masks = get_txt_embeddings(prompt, self.config)
-        dit = get_dit(self.config)
+        dit = get_dit(self.config, self.experiment_ctx)
         videos = torch.cat(
             [
                 post_chunk_process(chunk, self.config)

@@ -42,6 +42,7 @@ from torch.nn import Parameter
 from inference.common import EngineConfig, InferenceParams, ModelConfig, ModelMetaArgs, PackedCrossAttnParams, divide
 from inference.infra.distributed import parallel_state
 from inference.infra.parallelism import CSOHelper, UlyssesScheduler, cso_communication
+from inference.quantizers import ExperimentContext
 
 
 ##########################################################
@@ -778,11 +779,12 @@ class Attention(torch.nn.Module):
     Attention layer abstract class.
     """
 
-    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, layer_number: int):
+    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, layer_number: int):
         super().__init__()
 
         self.model_config: ModelConfig = model_config
         self.engine_config: EngineConfig = engine_config
+        self.experiment_ctx = experiment_ctx
         self.layer_number = layer_number
 
         self.hidden_size_per_attention_head = self.model_config.kv_channels
@@ -849,8 +851,8 @@ def split_tensor_along_last_dim(
 
 
 class FullyParallelAttention(Attention):
-    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, layer_number: int):
-        super().__init__(model_config=model_config, engine_config=engine_config, layer_number=layer_number)
+    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, layer_number: int):
+        super().__init__(model_config=model_config, engine_config=engine_config, experiment_ctx=experiment_ctx, layer_number=layer_number)
 
         # output 2x query, one for self-attn, one for cross-attn with condition
         self.linear_qkv = CustomLayerNormLinear(
@@ -1256,17 +1258,18 @@ class TransformerLayer(torch.nn.Module):
     output of the same size.
     """
 
-    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, layer_number: int = 1):
+    def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, layer_number: int = 1):
         super().__init__()
         self.model_config = model_config
         self.engine_config = engine_config
+        self.experiment_ctx = experiment_ctx
         self.layer_number = layer_number + self._get_layer_offset()
         ## [Module 1: ada_modulate_layer
         self.ada_modulate_layer = AdaModulateLayer(model_config=self.model_config)
 
         ## [Module 2: SelfAttention]
         self.self_attention = FullyParallelAttention(
-            model_config=self.model_config, engine_config=self.engine_config, layer_number=self.layer_number
+            model_config=self.model_config, engine_config=self.engine_config, experiment_ctx=self.experiment_ctx, layer_number=self.layer_number
         )
 
         ## [Module 3: SelfAttention PostNorm]
@@ -1374,12 +1377,13 @@ class TransformerBlock(torch.nn.Module):
     """Transformer class."""
 
     def __init__(
-        self, model_config: ModelConfig, engine_config: EngineConfig, pre_process: bool = True, post_process: bool = True
+        self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, pre_process: bool = True, post_process: bool = True
     ):
         super().__init__()
 
         self.model_config = model_config
         self.engine_config = engine_config
+        self.experiment_ctx = experiment_ctx
         self.pre_process = pre_process
         self.post_process = post_process
 
@@ -1390,7 +1394,7 @@ class TransformerBlock(torch.nn.Module):
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
             [
-                TransformerLayer(model_config=self.model_config, engine_config=self.engine_config, layer_number=i)
+                TransformerLayer(model_config=self.model_config, engine_config=self.engine_config, experiment_ctx=self.experiment_ctx, layer_number=i)
                 for i in range(layer_number)
             ]
         )

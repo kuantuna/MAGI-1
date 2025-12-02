@@ -82,6 +82,7 @@ class VideoDiTModel(torch.nn.Module):
         self.videodit_blocks = TransformerBlock(
             model_config=self.model_config,
             engine_config=self.engine_config,
+            experiment_ctx=self.experiment_ctx,
             pre_process=pre_process,
             post_process=post_process,
         )
