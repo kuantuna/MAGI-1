@@ -16,6 +16,7 @@ import argparse
 import sys
 
 from inference.pipeline import MagiPipeline
+from inference.quantizers import ExperimentContext, KVQuantizer, QDType, Granularity, QuantLocation
 
 
 def parse_arguments():
@@ -33,8 +34,20 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    kv_quantizer = KVQuantizer.from_cfg(
+        key_qdtype=QDType.INT8,
+        key_granularity=Granularity.PER_TENSOR,
+        key_location=QuantLocation.CACHE_ONLY,
+        value_qdtype=QDType.INT8,
+        value_granularity=Granularity.PER_TENSOR,
+        value_location=QuantLocation.CACHE_ONLY,
+    )
+    experiment_ctx = ExperimentContext(
+        name="default_experiment",
+        kv_quantizer=kv_quantizer
+    )
 
-    pipeline = MagiPipeline(args.config_file)
+    pipeline = MagiPipeline(args.config_file, experiment_ctx=experiment_ctx)
 
     if args.mode == 't2v':
         pipeline.run_text_to_video(prompt=args.prompt, output_path=args.output_path)
