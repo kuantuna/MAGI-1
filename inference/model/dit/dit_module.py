@@ -849,6 +849,31 @@ def split_tensor_along_last_dim(
 
     return tensor_list
 
+def sdpa_with_weights(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False) -> tuple[torch.Tensor, torch.Tensor]:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value, attn_weight
+
 
 class FullyParallelAttention(Attention):
     def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, layer_number: int):
@@ -1022,7 +1047,7 @@ class FullyParallelAttention(Attention):
         key_xattn = self.k_layernorm_xattn(key_xattn)
         return query_xattn, key_xattn, value_xattn
 
-    def core_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, bs: int, meta_args: ModelMetaArgs):
+    def core_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, bs: int, meta_args: ModelMetaArgs, return_attn_weights: bool = False):
         # (sq b) hn hd -> b sq hn hd
         query = query.reshape(-1, bs, query.shape[1], query.shape[2]).transpose(0, 1).contiguous()
         # (sq b) hn hd -> b sq hn hd
@@ -1061,7 +1086,18 @@ class FullyParallelAttention(Attention):
                     q = query[:, q_range[0, 0] : q_range[0, 1]]
                     k = key[:, k_range[0, 0] : k_range[0, 1]]
                     v = value[:, k_range[0, 0] : k_range[0, 1]]
-                o = flash_attn_func(q=q, k=k, v=v, deterministic=torch.are_deterministic_algorithms_enabled())
+                if return_attn_weights:
+                    o, attn_weights = sdpa_with_weights(
+                        query=q.transpose(1, 2),
+                        key=k.transpose(1, 2),
+                        value=v.transpose(1, 2),
+                        is_causal=False,
+                        enable_gqa=True,
+                    )
+                    del attn_weights
+                    o = o.transpose(1, 2) 
+                else:
+                    o = flash_attn_func(q=q, k=k, v=v, deterministic=torch.are_deterministic_algorithms_enabled())
                 o = rearrange(o, "b sq h d -> (sq b) h d", b=bs)
                 core_attn_outs.append(o)
             core_attn_out = torch.cat(core_attn_outs, dim=0)
