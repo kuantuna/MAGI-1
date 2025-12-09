@@ -43,7 +43,9 @@ from inference.common import EngineConfig, InferenceParams, ModelConfig, ModelMe
 from inference.infra.distributed import parallel_state
 from inference.infra.parallelism import CSOHelper, UlyssesScheduler, cso_communication
 from inference.quantizers import ExperimentContext
+from inference.attention_utils import get_video_grid_info, dump_head_stats_to_csv, sdpa_with_scores
 
+from inference.common import print_rank_0
 
 ##########################################################
 # TimestepEmbedder
@@ -849,31 +851,6 @@ def split_tensor_along_last_dim(
 
     return tensor_list
 
-def sdpa_with_weights(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False) -> tuple[torch.Tensor, torch.Tensor]:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias = attn_mask + attn_bias
-
-    if enable_gqa:
-        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
-        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value, attn_weight
-
 
 class FullyParallelAttention(Attention):
     def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, experiment_ctx: ExperimentContext, layer_number: int):
@@ -1047,7 +1024,7 @@ class FullyParallelAttention(Attention):
         key_xattn = self.k_layernorm_xattn(key_xattn)
         return query_xattn, key_xattn, value_xattn
 
-    def core_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, bs: int, meta_args: ModelMetaArgs, return_attn_weights: bool = False):
+    def core_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, bs: int, meta_args: ModelMetaArgs, return_attn_weights: bool = True):
         # (sq b) hn hd -> b sq hn hd
         query = query.reshape(-1, bs, query.shape[1], query.shape[2]).transpose(0, 1).contiguous()
         # (sq b) hn hd -> b sq hn hd
@@ -1087,14 +1064,49 @@ class FullyParallelAttention(Attention):
                     k = key[:, k_range[0, 0] : k_range[0, 1]]
                     v = value[:, k_range[0, 0] : k_range[0, 1]]
                 if return_attn_weights:
-                    o, attn_weights = sdpa_with_weights(
+                    chunk_idx = int(k.size(1) / q.size(1)) - 1
+                    denoising_step_list = meta_args.current_denoising_step_list
+                    assert denoising_step_list is not None
+                    print_rank_0(f"Layer {self.layer_number} Chunk {chunk_idx} Denoising Step {denoising_step_list[i]}")
+                    o, attn_weights = sdpa_with_scores(
                         query=q.transpose(1, 2),
                         key=k.transpose(1, 2),
                         value=v.transpose(1, 2),
-                        is_causal=False,
                         enable_gqa=True,
+                        q_chunk_size=q.size(1) if chunk_idx < 1 else 2025,
                     )
+                    q_chunk, q_frame, q_y, q_x, k_chunk, k_frame, k_y, k_x = get_video_grid_info(
+                        query_len=q.size(1),
+                        key_len=k.size(1),
+                        current_chunk_idx=chunk_idx,
+                        device=q.device,
+                    )
+                    dump_head_stats_to_csv(
+                        csv_path="/home/tuna_tuncer/projects/magi-fork/MAGI-1/experiment1/head_stats.csv",
+                        attn=attn_weights[0], # assumed batch size 1
+                        q_chunk=q_chunk,
+                        q_frame=q_frame,
+                        q_y=q_y,
+                        q_x=q_x,
+                        k_chunk=k_chunk,
+                        k_frame=k_frame,
+                        k_y=k_y,
+                        k_x=k_x,
+                        chunk_idx=chunk_idx,
+                        layer_idx=self.layer_number,
+                        step_idx=denoising_step_list[i],
+                        r_spatial=5,
+                    )
+                    # vis_attn_downsample(attn_weights, block_q=45, block_k=45, save_path=f"/home/tuna_tuncer/projects/magi-fork/MAGI-1/experiment0/p1_c{chunk_idx}_s{denoising_step_list[i]}_l{self.layer_number}.png")
+                        # q_frame, q_y, q_x, k_frame, k_y, k_x = get_video_grid_info(q.size(1), k.size(1), attn_weights_cpu.device)
+                        # stats = compute_head_stats(attn_weights_cpu, q_frame, q_y, q_x, k_frame, k_y, k_x, r_spatial=5)
+                        # classified_types = classify_heads(stats)
+                        # with open("/home/tuna_tuncer/projects/magi-fork/MAGI-1/experiment0/attention_stats.csv", 'a') as f:
+                        #     for h in range(attn_weights_cpu.shape[1]):
+                        #         line = f"{chunk_idx},{self.layer_number},{denoising_step_list[i]},{h},{stats['P_sf'][h].item()},{stats['P_cf'][h].item()},{stats['P_sf_local'][h].item()},{stats['P_sf_global'][h].item()},{stats['P_cf_local'][h].item()},{stats['P_cf_global'][h].item()},{stats['entropy'][h].item()},{classified_types[h]}\n"
+                        #         f.write(line)
                     del attn_weights
+                    torch.cuda.empty_cache()
                     o = o.transpose(1, 2) 
                 else:
                     o = flash_attn_func(q=q, k=k, v=v, deterministic=torch.are_deterministic_algorithms_enabled())
