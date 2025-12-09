@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -41,7 +41,7 @@ class PackedCrossAttnParams:
     max_seqlen_kv: int = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class ModelMetaArgs:
     H: int
     W: int
@@ -57,6 +57,7 @@ class ModelMetaArgs:
     enable_cuda_graph: bool
     core_attn_params: PackedCoreAttnParams
     cross_attn_params: PackedCrossAttnParams
+    current_denoising_step_list: Optional[List[int]] = None
 
 
 class InferenceParams:

@@ -654,6 +654,7 @@ class SampleTransport:
             nearly_clean_chunk_t > self.engine_config.distill_nearly_clean_chunk_threshold
         )
         model_kwargs["distill_interval"] = self.time_interval[infer_idx][denoise_idx]
+        model_kwargs["denoise_step_of_each_chunk"] = denoise_step_of_each_chunk
         velocity = forward_fn(
             x=x_chunk,
             timestep=t,

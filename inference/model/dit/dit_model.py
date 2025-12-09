@@ -384,6 +384,7 @@ class VideoDiTModel(torch.nn.Module):
             # clone a new tensor to ensure x is not a view of other tensor
             x = x.clone()
 
+        meta_args.current_denoising_step_list = kwargs["denoise_step_of_each_chunk"]
         x = self.videodit_blocks.forward(
             hidden_states=x,
             condition=condition,
